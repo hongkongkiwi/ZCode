@@ -11,6 +11,7 @@ import {
   getWebRemoteControlHeartbeatJitterMs,
   getWebRemoteControlReconnectJitterMs,
   WEB_REMOTE_CONTROL_RPC_TRANSPORT_LIMITS,
+  WebRemoteControlAppPayloadAssembler,
   parseWebRemoteControlAppPayload,
   type WebRemoteControlAppPayload,
   type WebRemoteControlFailure,
@@ -247,6 +248,9 @@ export class WebRemoteControlTerminalTransport {
   private desktopOfflineFailureTimer?: ReturnType<typeof setTimeout>;
   private readonly traceRelayMessages = import.meta.env.DEV;
   private readonly payloadSerializer = new WebRemoteControlRelayPayloadSerializer();
+  private readonly payloadAssembler = new WebRemoteControlAppPayloadAssembler({
+    deliver: (payload) => this.deliverAssembledPayload(payload),
+  });
 
   constructor(private readonly options: WebRemoteControlTerminalTransportOptions) {
     this.WebSocketCtor = options.WebSocketCtor ?? globalThis.WebSocket;
@@ -331,6 +335,8 @@ export class WebRemoteControlTerminalTransport {
       this.stopHeartbeat();
       this.clearWaitingTimer();
       this.clearStaleWaitingRecoveryTimer();
+      // 断线后丢弃半途 app payload 分片，重连后由桌面端完整重发。
+      this.payloadAssembler.dispose();
       if (this.intentionallyClosed) {
         return;
       }
@@ -567,6 +573,17 @@ export class WebRemoteControlTerminalTransport {
     if (isRawTransportCandidate(payload) && this.options.onRawTransportPayload?.(payload)) {
       return;
     }
+    if (this.payloadAssembler.ingest(payload)) {
+      return;
+    }
+    const parsed = parseWebRemoteControlAppPayload(payload);
+    if (!parsed) {
+      return;
+    }
+    this.options.onPayload(parsed);
+  }
+
+  private deliverAssembledPayload(payload: unknown): void {
     const parsed = parseWebRemoteControlAppPayload(payload);
     if (!parsed) {
       return;

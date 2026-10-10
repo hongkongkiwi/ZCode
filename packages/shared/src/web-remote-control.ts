@@ -537,6 +537,17 @@ export interface WebRemoteControlBootstrapResponsePayload {
   result: WebRemoteControlWindowBootstrapResult;
 }
 
+export interface WebRemoteControlAppPayloadFragmentPayload {
+  zcode_type: "app-payload-fragment";
+  transferId: string;
+  fragmentIndex: number;
+  fragmentCount: number;
+  /** 重组后的逻辑 payload JSON 的 UTF-8 字节数，用于重组端完整性校验。 */
+  payloadBytes: number;
+  /** 逻辑 payload JSON 的 UTF-16 码元切片，按 fragmentIndex 顺序拼接即无损还原。 */
+  fragmentText: string;
+}
+
 export interface WebRemoteControlWorkspaceListRequestPayload {
   zcode_type: "workspace-list-request";
   requestId: string;
@@ -709,6 +720,7 @@ export type WebRemoteControlAppPayload =
   | WebRemoteControlPlatformRequestPayload
   | WebRemoteControlPlatformResponsePayload
   | WebRemoteControlRpcTransportPayload
+  | WebRemoteControlAppPayloadFragmentPayload
   | WebRemoteControlBridgeDegradedPayload
   | WebRemoteControlAppErrorPayload
   | WebRemoteControlMobileDiagnosticPayload;

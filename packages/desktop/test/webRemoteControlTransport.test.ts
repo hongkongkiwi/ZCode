@@ -3,6 +3,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import type { AddressInfo } from "node:net";
 import {
   WEB_REMOTE_CONTROL_RPC_TRANSPORT_LIMITS,
+  WebRemoteControlAppPayloadAssembler,
   encodeWebRemoteControlRpcTransportMessage,
   type WebRemoteControlAppPayload,
 } from "@zcode/shared";
@@ -294,13 +295,96 @@ describe("WebRemoteControlDeviceTransport", () => {
         error: "bounded",
       }),
     ).toEqual({ kind: "unavailable" });
+    // 未配对时，单帧超限但现在可分片的 payload 按“临时不可用”处理（等配对后 flush）。
     expect(
       transport.sendPayloadResult({
         zcode_type: "app-error",
         reason: "unexpected-error",
         error: "x".repeat(WEB_REMOTE_CONTROL_RPC_TRANSPORT_LIMITS.maxPhysicalFrameBytes),
       }),
+    ).toEqual({ kind: "unavailable" });
+    // 超过 maxMessageBytes（16MiB）才判为永久 oversize。
+    expect(
+      transport.sendPayloadResult({
+        zcode_type: "app-error",
+        reason: "unexpected-error",
+        error: "x".repeat(WEB_REMOTE_CONTROL_RPC_TRANSPORT_LIMITS.maxMessageBytes),
+      }),
     ).toMatchObject({ kind: "oversize" });
+  });
+
+  it("fragments oversize app payloads into single-frame relay envelopes when paired", async () => {
+    const relay = await createRelayServer(({ message, socket }) => {
+      if (message.type === "auth_init") {
+        socket.send(
+          JSON.stringify({ type: "auth_ack", device_sid: "sid-1", pair_status: "matched" }),
+        );
+      }
+    });
+    const states: WebRemoteControlDeviceTransportState[] = [];
+    const transport = new WebRemoteControlDeviceTransport({
+      relayWsUrl: relay.url,
+      deviceMid: "mid-1",
+      auth: { mode: "persisted", deviceSid: "sid-1", passHash: "hash-1" },
+      meta: { platform: "darwin", version: "1.0.0", name: "Mac" },
+      authProvider: {
+        createPassword: () => "password",
+        createPassHash: () => "hash-1",
+        calculateProof: () => "proof",
+      },
+      logger: createLogger(),
+      onRegisteredAuth: () => {},
+      onStateChange: (state) => states.push(state),
+      onPayload: () => {},
+      onError: () => {},
+      onInvalidPersistedAuth: async () => {},
+    });
+
+    try {
+      transport.start();
+      await waitUntil(() => states.includes("paired"));
+      relay.rawMessages.length = 0;
+
+      const fillerLength =
+        WEB_REMOTE_CONTROL_RPC_TRANSPORT_LIMITS.maxPhysicalFrameBytes + 128 * 1024;
+      const payload = {
+        zcode_type: "bootstrap-response",
+        requestId: "req-fragment-1",
+        success: true,
+        result: { filler: "x".repeat(fillerLength) },
+      } as unknown as WebRemoteControlAppPayload;
+
+      const result = transport.sendPayloadResult(payload);
+      expect(result).toMatchObject({ kind: "sent" });
+      await waitUntil(() => relay.rawMessages.length >= 2);
+
+      for (const raw of relay.rawMessages) {
+        expect(Buffer.byteLength(raw, "utf8")).toBeLessThanOrEqual(
+          WEB_REMOTE_CONTROL_RPC_TRANSPORT_LIMITS.maxPhysicalFrameBytes,
+        );
+      }
+      const fragmentPayloads = relay.rawMessages.map(
+        (raw) => (JSON.parse(raw) as { payload: unknown }).payload,
+      );
+      const deliveredPayloads: unknown[] = [];
+      const assembler = new WebRemoteControlAppPayloadAssembler({
+        deliver: (delivered) => deliveredPayloads.push(delivered),
+      });
+      for (const fragmentPayload of fragmentPayloads) {
+        expect(assembler.ingest(fragmentPayload)).toBe(true);
+      }
+      expect(deliveredPayloads).toHaveLength(1);
+      expect(deliveredPayloads[0]).toMatchObject({
+        zcode_type: "bootstrap-response",
+        requestId: "req-fragment-1",
+      });
+      expect(
+        (deliveredPayloads[0] as { result?: { filler?: string } }).result?.filler?.length,
+      ).toBe(fillerLength);
+      assembler.dispose();
+    } finally {
+      transport.dispose();
+    }
   });
 
   it("does not write relay message trace in local development runtime", async () => {

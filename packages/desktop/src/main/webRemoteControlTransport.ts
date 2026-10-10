@@ -1,6 +1,6 @@
 /* eslint-disable max-lines -- 外部 relay transport 需要集中维护握手、配对、心跳和重连状态机。 */
 import { WebSocket, type RawData } from "ws";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   WebRemoteControlRelayPayloadSerializer,
   type WebRemoteControlPayloadSendResult,
@@ -13,6 +13,7 @@ import {
   getWebRemoteControlHeartbeatJitterMs,
   getWebRemoteControlReconnectJitterMs,
   WEB_REMOTE_CONTROL_RPC_TRANSPORT_LIMITS,
+  fragmentAppPayloadJson,
   parseWebRemoteControlAppPayload,
   type WebRemoteControlAppPayload,
   type WebRemoteControlRelayDeviceMeta,
@@ -225,11 +226,29 @@ export class WebRemoteControlDeviceTransport {
   sendPayloadResult(payload: WebRemoteControlAppPayload): WebRemoteControlPayloadSendResult {
     const prepared = this.payloadSerializer.prepare(payload);
     if (this.payloadSerializer.isOversize(prepared)) {
-      return {
-        kind: "oversize",
-        bytes: prepared.bytes,
-        maxBytes: WEB_REMOTE_CONTROL_RPC_TRANSPORT_LIMITS.maxPhysicalFrameBytes,
-      };
+      // Bugfix: bootstrap-response / workspace-list-updated 随工作区与任务数量自然增长，
+      // 越过单帧上限后曾被整体丢弃，手机端 bootstrap 永远等不到响应
+      // （mobile 侧表现为 desktop-bootstrap-timeout）。改为按 relay 单帧上限透明分片，
+      // 与 rpc-frame 共用同一组限额常量；超过 maxMessageBytes / maxFragments 才真正判 oversize。
+      const fragmented = fragmentAppPayloadJson(JSON.stringify(payload), randomUUID());
+      if (fragmented.kind === "rejected") {
+        return {
+          kind: "oversize",
+          bytes: prepared.bytes,
+          maxBytes: WEB_REMOTE_CONTROL_RPC_TRANSPORT_LIMITS.maxPhysicalFrameBytes,
+        };
+      }
+      if (this.state !== "paired" || this.staleWaitingCount > 0) {
+        return { kind: "unavailable" };
+      }
+      for (const envelope of fragmented.envelopes) {
+        if (!this.sendSerialized(envelope.message, envelope.json)) {
+          // 半途写失败：让手机端重组超时丢弃残片，本次调用按临时不可用处理，
+          // 上层 buffer flush 会用新的 transferId 完整重发。
+          return { kind: "unavailable" };
+        }
+      }
+      return { kind: "sent", bytes: prepared.bytes };
     }
     if (this.state !== "paired" || this.staleWaitingCount > 0) {
       return { kind: "unavailable" };

@@ -5,6 +5,7 @@ import {
   WEB_REMOTE_CONTROL_RPC_TRANSPORT_LIMITS,
   WEB_REMOTE_CONTROL_WORKSPACE_RECONNECT_TIMEOUT_MS,
   encodeWebRemoteControlRpcTransportMessage,
+  fragmentAppPayloadJson,
   type WebRemoteControlAppPayload,
 } from "@zcode/shared";
 import {
@@ -266,6 +267,60 @@ describe("WebRemoteControlTerminalTransport", () => {
         reason: "unexpected-error",
       });
       expect(rawFaults).toEqual(["remote.rpcFrame.envelopeTooLarge"]);
+    } finally {
+      transport.dispose();
+    }
+  });
+
+  it("reassembles fragmented app payloads and routes them through onPayload", async () => {
+    const payloads: WebRemoteControlAppPayload[] = [];
+    const fillerLength = WEB_REMOTE_CONTROL_RPC_TRANSPORT_LIMITS.maxPhysicalFrameBytes + 64 * 1024;
+    const logicalPayloadJson = JSON.stringify({
+      zcode_type: "app-error",
+      reason: "unexpected-error",
+      error: "x".repeat(fillerLength),
+    });
+    const fragmented = fragmentAppPayloadJson(logicalPayloadJson, "transfer-web-1");
+    if (fragmented.kind !== "fragmented") throw new Error("expected fragmented");
+    const relay = await createRelayServer(({ message, socket }) => {
+      if (message.type === "auth_init") {
+        socket.send(JSON.stringify({ type: "auth_challenge", nonce: "nonce-1" }));
+      }
+      if (message.type === "auth_response") {
+        socket.send(
+          JSON.stringify({ type: "auth_ack", device_sid: "sid-1", pair_status: "matched" }),
+        );
+        for (const envelope of fragmented.envelopes) {
+          socket.send(envelope.json);
+        }
+      }
+    });
+    const transport = new WebRemoteControlTerminalTransport({
+      relayWsUrl: relay.url,
+      deviceSid: "sid-1",
+      passHash: "hash-1",
+      deviceMid: "mid-1",
+      WebSocketCtor: WebSocket as unknown as typeof globalThis.WebSocket,
+      authProvider: { calculateProof: async () => "proof" },
+      onPayload: (payload) => payloads.push(payload),
+      onStateChange: () => {},
+      onFailure: () => {},
+      onError: () => {},
+      reloadPage: () => {},
+    });
+
+    try {
+      transport.start();
+      await waitUntil(
+        () => payloads.some((payload) => (payload as { zcode_type?: string }).zcode_type === "app-error"),
+        5_000,
+      );
+      expect(payloads).toHaveLength(1);
+      expect(payloads[0]).toMatchObject({
+        zcode_type: "app-error",
+        reason: "unexpected-error",
+      });
+      expect((payloads[0] as { error?: string }).error?.length).toBe(fillerLength);
     } finally {
       transport.dispose();
     }
