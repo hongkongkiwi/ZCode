@@ -25,6 +25,7 @@ import { sessionWorkflowActivitySchema } from "./zcode-protocol-v4/sessions-inde
 import {
   webRemoteControlRpcTransportAckSchema,
   webRemoteControlRpcTransportFrameSchema,
+  WEB_REMOTE_CONTROL_RPC_TRANSPORT_LIMITS,
 } from "./web-remote-control-rpc-transport.js";
 import {
   taskOwnerCommandDeliverySchema,
@@ -235,6 +236,31 @@ const webRemoteControlAppPayloadSchemas = [
     zcode_type: z.literal("bootstrap-request"),
     requestId: nonEmptyStringSchema,
   }),
+  z
+    .object({
+      zcode_type: z.literal("app-payload-fragment"),
+      transferId: nonEmptyStringSchema,
+      fragmentIndex: z
+        .number()
+        .int()
+        .nonnegative()
+        .max(WEB_REMOTE_CONTROL_RPC_TRANSPORT_LIMITS.maxFragments - 1),
+      fragmentCount: z
+        .number()
+        .int()
+        .positive()
+        .max(WEB_REMOTE_CONTROL_RPC_TRANSPORT_LIMITS.maxFragments),
+      payloadBytes: z
+        .number()
+        .int()
+        .positive()
+        .max(WEB_REMOTE_CONTROL_RPC_TRANSPORT_LIMITS.maxMessageBytes),
+      fragmentText: z
+        .string()
+        .min(1)
+        .max(WEB_REMOTE_CONTROL_RPC_TRANSPORT_LIMITS.maxPhysicalFrameBytes),
+    })
+    .strict(),
   z.object({
     zcode_type: z.literal("bootstrap-response"),
     requestId: nonEmptyStringSchema,
