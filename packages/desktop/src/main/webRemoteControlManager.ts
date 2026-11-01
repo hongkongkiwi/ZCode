@@ -1637,7 +1637,9 @@ export function createWebRemoteControlManager(dependencies: WebRemoteControlMana
     const info = runtime.mobileDeviceInfo;
     dependencies.mobileLogSink.append(
       {
-        deviceKey: payload.device?.id ?? (resolveMobileLogDeviceLabel(runtime) || "unknown-device"),
+        // 磁盘分区键必须用桌面侧可信的配对身份：手机自报 device.id 只进 header
+        // 元数据，否则已配对端轮换自报 id 可绕过按设备目录的磁盘预算。
+        deviceKey: runtime.deviceSid || "unknown-device",
         sessionKey: payload.sessionId ?? runtime.deviceSid,
         header: {
           device:
