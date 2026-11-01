@@ -1385,7 +1385,9 @@ type CommandResult =
   `failed/fault.command.inputDiscardedOnRestart` 直接清账且不呈现 UI 错误；只有 delivery=`startNow`
   生成一次 recoverable notice。UI 只在用户点击“重新发送”后用**新 commandId**提交保存的 input
   payload。无 payload 的敏感 interaction 遇到 `unknown` 也保留待确认线索。queryUnavailable 保留条目并
-  等待下次连接对账，不伪装成 unknown。
+  等待下次连接对账，不伪装成 unknown。该保留规则对**直接 ACK 路径**（`v4/command` 的同步响应）与
+  重连 query 路径一致：queryUnavailable 只证明本次持久化查询失败，不构成执行失败，也不构成敏感
+  interaction 的确定 ACK，两条路径都不得据此清账。
 - 连接存续期内的丢帧由 rpc 重放兜底，客户端不做应用层定时重发。
 
 ### 6.3 多端并发裁决（03 收口，用 ACK 枚举重述）

@@ -240,6 +240,12 @@ export class PendingCommandRegistry {
   applyAck(envelope: CommandEnvelope, ack: CommandAck): void {
     let entry = this.entries.get(keyOf(envelope.sessionId, envelope.commandId));
     if (!entry) return;
+    // 与 applyQuery 对齐：queryUnavailable 只证明本次持久化查询失败，不能证明命令
+    // 从未执行。这里清账会把 ACK 丢失后的重试误报为失败，并丢掉对账线索（含敏感
+    // interaction 的 digest 条目，它同样要等明确结果）。
+    if (ack.status === "failed" && ack.reasonCode === "fault.command.queryUnavailable") {
+      return;
+    }
     if (entry.replay.kind === "sensitiveDigest") {
       // 交互答案不可重放；拿到确定 ACK 后其对账职责已结束。
       this.settle(entry.sessionId, entry.commandId);
