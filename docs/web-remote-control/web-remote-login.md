@@ -11,6 +11,7 @@
 - 无 JWT 时渲染登录页；appReturnTo 为当前完整 URL。安全回跳只保留同源 `/remote/v4`、`/remote/__test__`（均含尾斜杠）和既有分享路径，query 白名单为 app_version/sid/mid/name。
 - 有 JWT、有 SID 直接申请 terminal token 并连接 V2；无 SID 时按当前账号读取设备，最近 SID 在线则直连；最近 SID 不在线但同一台电脑（最近 MID）恰好只有一个在线连接时直连该连接；否则显示设备列表（规则见[落点](./relay-v2-pairing.md#落点状态归属与刷新)）。离线设备不可点击；选中在线设备回写 sid/mid/name/app_version 后连接，支持手动和回前台刷新。设备页标题下显示当前登录账号与平台，“切换”打开下文的切换账号确认弹窗。
 - token 401 清本地会话并回登录门禁，无需确认；用户手动“切换账号”需先确认，再清会话并保留当前 URL。AUTH_FAILED 不当作网络错误无限重试。
+- 同源其他标签页登出或写入新凭据时，本页已建立的连接与设备列表立即失效：凭据被移除走既有 `Entry.switchAccount()`（清会话回登录页，URL 保留）；JWT 值变化按新身份重新入场（`start()`）。判定以 token 值为准（本应用 JWT 只经 OAuth 回调写入，无静默续期路径）；本页自身的写入不触发（storage 事件只发给其他标签页）。实现经注入的 `subscribeAuthChange`（入口接到 window `storage` 事件），任意键变化只触发一次 JWT 比较，不复制认证状态。
 
 ### 手动切换账号确认
 
