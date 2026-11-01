@@ -54,6 +54,8 @@ export interface WebRemoteControlEntryOptions {
   locale: "zh-CN" | "en-US";
   devices(jwt: string, signal: AbortSignal): Promise<WebRemoteControlRelayV2Device[]>;
   subscribeVisible(listener: () => void): () => void;
+  /** 同源其他标签页的认证变化（storage 事件等）；已建立连接据此失效，见 web-remote-login.md。 */
+  subscribeAuthChange?(listener: () => void): () => void;
   loginOptions?: Parameters<WebAuthService["startLogin"]>[0];
   token(jwt: string, signal: AbortSignal): Promise<string>;
   connect(connection: WebRemoteControlEntryConnection): void;

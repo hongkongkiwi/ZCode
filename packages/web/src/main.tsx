@@ -402,6 +402,12 @@ const remoteEntry = new WebRemoteControlEntry({
     document.addEventListener("visibilitychange", onVisibilityChange);
     return () => document.removeEventListener("visibilitychange", onVisibilityChange);
   },
+  // storage 事件只发给同源其他标签页；任意键变化都触发一次廉价的 JWT 比较，
+  // 由 Entry 决定其他页登出/换号后本页连接是否失效。
+  subscribeAuthChange: (listener) => {
+    window.addEventListener("storage", listener);
+    return () => window.removeEventListener("storage", listener);
+  },
   loginOptions: { devReturnTo: resolveWebAuthDevReturnTo(WEB_ZAI_OAUTH_CONFIG) },
   token: createWebRemoteControlV2TokenClient(window.location.origin),
   connect: (connection) => {

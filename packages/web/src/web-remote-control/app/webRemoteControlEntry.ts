@@ -66,18 +66,40 @@ export class WebRemoteControlEntry {
         acceptedJwt?: string;
       }
     | undefined;
+  /** 当前活动列表/连接建立时的 JWT；跨标签页认证变化按它判定是否失效。 */
+  private authBaseline: string | undefined;
+  private readonly unsubscribeAuthChange: (() => void) | undefined;
 
-  constructor(private readonly options: WebRemoteControlEntryOptions) {}
+  constructor(private readonly options: WebRemoteControlEntryOptions) {
+    // storage 事件只发给同源其他标签页，本页自身的登出/登录不会自触发；订阅跨整个
+    // Entry 生命周期，不随 reset 重建（Entry 在入口处单例构造）。
+    this.unsubscribeAuthChange = options.subscribeAuthChange?.(() => this.handleAuthChange());
+  }
 
   dispose(): void {
     this.scope.abort();
     this.list?.unsubscribe();
     this.list = undefined;
+    this.authBaseline = undefined;
   }
 
   private reset(): void {
     this.dispose();
     this.scope = new AbortController();
+  }
+
+  /**
+   * 跨标签页认证变化：其他页登出/换号后，本页已建立的连接不能再以旧身份继续。
+   * JWT 值相同（同账号）不打扰；凭据被移除走既有 switchAccount，值变化按新身份重新入场。
+   */
+  private handleAuthChange(): void {
+    const baseline = this.authBaseline;
+    if (baseline === undefined) return;
+    const current = this.options.auth.getZCodeJwtToken();
+    if (current === baseline) return;
+    this.authBaseline = undefined;
+    if (!current) void this.switchAccount();
+    else void this.start();
   }
 
   async start(): Promise<void> {
@@ -116,6 +138,8 @@ export class WebRemoteControlEntry {
       // iOS 私密模式等环境可能禁用存储；最近设备只是偏好，不阻断入口。
     }
     const account = this.options.auth.getActiveAccount() ?? undefined;
+    const jwt = this.options.auth.getZCodeJwtToken();
+    if (jwt) this.authBaseline = jwt;
     this.list = {
       view: {
         kind: "devices",
@@ -280,6 +304,8 @@ export class WebRemoteControlEntry {
     canResolveLostTarget = true,
   ): void {
     this.reset();
+    const jwt = this.options.auth.getZCodeJwtToken();
+    if (jwt) this.authBaseline = jwt;
     const { signal } = this.scope;
     // 接续出的连接配对前不能再接续，避免新目标立即失败时在 SID 间循环；配对成功后恢复。
     let resolveLostTarget = canResolveLostTarget;
