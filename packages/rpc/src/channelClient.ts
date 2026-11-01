@@ -149,11 +149,40 @@ export class ChannelClient implements IChannelClient, IDisposable {
   }
 
   private requestEvent(channelName: string, name: string, arg?: any): Event<any> {
-    const id = this.lastRequestId++;
+    // 订阅按周期管理：第一个监听者出现 → 最后一个监听者离开为一个周期，每个周期
+    // 独立分配 requestId 并安装自己的 handler。周期结束即终态，初始化等待期间取消
+    // 的订阅不得在迟到 Initialize 后补发无主 EventListen；旧周期迟到的 EventFire
+    // 因 handler 已删、id 不复用而被丢弃，不会串入新周期的监听者。
+    let activeId: number | null = null;
+    let hasListeners = false;
+    const handleResponse = (id: number, response: IRawResponse) => {
+      if (response.type === ResponseType.EventFire) {
+        emitter.fire(response.data);
+      } else if (response.type === ResponseType.EventError) {
+        // 订阅失败必须结束其监听器，不能把错误对象写入终端等正常事件流，也不能继续保留旧请求。
+        this.handlers.delete(id);
+        if (activeId === id) {
+          activeId = null;
+          this.activeRequests.delete(emitter);
+        }
+        emitter.dispose();
+        const error = new Error(response.data.message);
+        error.name = response.data.name;
+        if (response.data.stack) error.stack = response.data.stack.join("\n");
+        console.error(`RPC event subscription failed: ${channelName}.${name}`, error);
+      }
+    };
     const emitter = new Emitter<any>({
       onWillAddFirstListener: () => {
+        hasListeners = true;
         const doRequest = () => {
+          if (this.isDisposed || !hasListeners || activeId !== null) {
+            return;
+          }
+          const id = this.lastRequestId++;
+          activeId = id;
           this.activeRequests.add(emitter);
+          this.handlers.set(id, (response) => handleResponse(id, response));
           this.sendRequest(RequestType.EventListen, id, channelName, name, arg);
         };
 
@@ -164,25 +193,17 @@ export class ChannelClient implements IChannelClient, IDisposable {
         }
       },
       onDidRemoveLastListener: () => {
+        hasListeners = false;
         this.activeRequests.delete(emitter);
+        const id = activeId;
+        if (id === null) {
+          // EventListen 尚未发出（含初始化等待期）：无需向对端发 EventDispose。
+          return;
+        }
+        activeId = null;
+        this.handlers.delete(id);
         this.sendCancelOrDispose(RequestType.EventDispose, id);
-        this.handlers.delete(id);
       },
-    });
-
-    this.handlers.set(id, (response) => {
-      if (response.type === ResponseType.EventFire) {
-        emitter.fire(response.data);
-      } else if (response.type === ResponseType.EventError) {
-        // 订阅失败必须结束其监听器，不能把错误对象写入终端等正常事件流，也不能继续保留旧请求。
-        this.handlers.delete(id);
-        this.activeRequests.delete(emitter);
-        emitter.dispose();
-        const error = new Error(response.data.message);
-        error.name = response.data.name;
-        if (response.data.stack) error.stack = response.data.stack.join("\n");
-        console.error(`RPC event subscription failed: ${channelName}.${name}`, error);
-      }
     });
 
     return emitter.event;

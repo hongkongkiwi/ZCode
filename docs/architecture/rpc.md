@@ -253,6 +253,17 @@ calc.listen<string>("onDidLog")((msg) => console.log(msg)); // 订阅事件
 业务事件交给监听器。调用方重新请求需创建新的订阅；失败不影响同通道的其他调用。
 旧客户端忽略未知的 `205` 响应；服务端仍不建立失败订阅，因此不会把错误伪装成正常事件。
 
+事件订阅按周期管理（`ChannelClient`，`listen()` 返回的 Event）：
+
+- "第一个监听者出现 → 最后一个监听者离开"构成一个订阅周期；每个周期独立分配
+  requestId 并安装自己的响应 handler。
+- 周期结束即终态：移除最后一个监听者会删除 handler，并（当 EventListen 已发出时）
+  发送 `EventDispose`。初始化等待期间取消不发任何帧；迟到的 `Initialize` 不得再为
+  已结束的周期补发 `EventListen`（幽灵订阅）。
+- 同一 Event 再次订阅开启新周期（新 requestId）：旧周期迟到的 `EventFire` 找不到
+  handler 而被丢弃，不会串入新周期的监听者。
+- `ChannelClient.dispose()` 后，仍在排队等待 Initialize 的订阅请求不再发出。
+
 ---
 
 ## Layer 4: IPCServer / IPCClient
