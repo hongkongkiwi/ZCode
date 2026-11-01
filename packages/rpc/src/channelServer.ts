@@ -10,13 +10,17 @@ import {
   ResponseType,
 } from "./channels.shared.js";
 
+/** channel 注册前暂存的请求；超时/取消/dispose 都是终态，必须把它移出队列并停掉定时器。 */
+interface PendingRequestEntry {
+  request: any;
+  timer: ReturnType<typeof setTimeout>;
+}
+
 export class ChannelServer<TContext = string> implements IChannelServer<TContext>, IDisposable {
   private channels = new Map<string, IServerChannel<TContext>>();
   private activeRequests = new Map<number, IDisposable>();
-  private pendingRequests = new Map<
-    string,
-    { request: any; timer: ReturnType<typeof setTimeout> }[]
-  >();
+  private pendingRequests = new Map<string, PendingRequestEntry[]>();
+  private disposed = false;
   private protocolListener: IDisposable | null;
 
   constructor(
@@ -56,6 +60,10 @@ export class ChannelServer<TContext = string> implements IChannelServer<TContext
   }
 
   private send(header: any, body: any = undefined): void {
+    // dispose 即终态：此后不再向对端发送任何响应。
+    if (this.disposed) {
+      return;
+    }
     const writer = new BufferWriter();
     serialize(writer, header);
     serialize(writer, body);
@@ -94,6 +102,9 @@ export class ChannelServer<TContext = string> implements IChannelServer<TContext
         return;
       case RequestType.PromiseCancel:
       case RequestType.EventDispose:
+        // 取消对 pending（channel 尚未注册）与 active 同为终态；只查
+        // activeRequests 会把已取消的请求留给迟到的 registerChannel 执行。
+        this.removePendingRequestById(header[1]);
         this.disposeActiveRequest(header[1]);
         return;
     }
@@ -254,27 +265,78 @@ export class ChannelServer<TContext = string> implements IChannelServer<TContext
       this.pendingRequests.set(request.channelName, pendingRequests);
     }
 
-    const timer = setTimeout(() => {
-      console.error(`Unknown channel: ${request.channelName}`);
-      if (request.type !== RequestType.Promise) {
-        return;
+    // 修复原因：超时定时器必须先把条目移出队列再回终态帧。旧实现只回 PromiseError
+    // 且不移除，已失败的请求会在迟到的 registerChannel 里被再次执行；而 EventListen
+    // 若只删队列不回帧，会把"等 channel 注册"变成永久静默死订阅（客户端监听器无人终结）。
+    const entry: PendingRequestEntry = {
+      request,
+      timer: setTimeout(() => {
+        this.removePendingEntry(request.channelName, entry);
+        console.error(`Unknown channel: ${request.channelName}`);
+        if (request.type === RequestType.Promise) {
+          this.sendResponse({
+            id: request.id,
+            data: {
+              name: "Unknown channel",
+              message: `Channel name '${request.channelName}' timed out after ${this.timeoutDelay}ms`,
+              stack: undefined,
+            },
+            type: ResponseType.PromiseError,
+          });
+          return;
+        }
+        // EventListen 超时复用 EventError 终结该次订阅周期（客户端释放监听器，可重新
+        // 订阅；旧客户端忽略未知 205 响应，见 docs/architecture/rpc.md Layer 3）。
+        this.sendResponse({
+          id: request.id,
+          type: ResponseType.EventError,
+          data: {
+            name: "Unknown channel",
+            message: `Channel name '${request.channelName}' timed out after ${this.timeoutDelay}ms`,
+          },
+        });
+      }, this.timeoutDelay),
+    };
+
+    pendingRequests.push(entry);
+  }
+
+  private removePendingEntry(channelName: string, entry: PendingRequestEntry): void {
+    const pendingRequests = this.pendingRequests.get(channelName);
+    if (!pendingRequests) {
+      return;
+    }
+    const index = pendingRequests.indexOf(entry);
+    if (index < 0) {
+      return;
+    }
+    pendingRequests.splice(index, 1);
+    if (pendingRequests.length === 0) {
+      this.pendingRequests.delete(channelName);
+    }
+  }
+
+  private removePendingRequestById(id: number): void {
+    for (const [channelName, entries] of this.pendingRequests) {
+      const index = entries.findIndex((pendingEntry) => pendingEntry.request.id === id);
+      if (index < 0) {
+        continue;
       }
-
-      this.sendResponse({
-        id: request.id,
-        data: {
-          name: "Unknown channel",
-          message: `Channel name '${request.channelName}' timed out after ${this.timeoutDelay}ms`,
-          stack: undefined,
-        },
-        type: ResponseType.PromiseError,
-      });
-    }, this.timeoutDelay);
-
-    pendingRequests.push({ request, timer });
+      const [entry] = entries.splice(index, 1);
+      clearTimeout(entry.timer);
+      if (entries.length === 0) {
+        this.pendingRequests.delete(channelName);
+      }
+      // 同一连接的请求 id 单调递增且唯一，命中即结束。
+      return;
+    }
   }
 
   private flushPendingRequests(channelName: string): void {
+    // registerChannel 的 flush 经 setTimeout 0 延迟，可能晚于 dispose 到达。
+    if (this.disposed) {
+      return;
+    }
     const requests = this.pendingRequests.get(channelName);
     if (!requests) {
       return;
@@ -295,11 +357,22 @@ export class ChannelServer<TContext = string> implements IChannelServer<TContext
   }
 
   dispose(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.disposed = true;
     this.protocolListener?.dispose();
     this.protocolListener = null;
     for (const disposable of this.activeRequests.values()) {
       disposable.dispose();
     }
     this.activeRequests.clear();
+    // dispose 后 pending 请求不得执行也不得回包：清空队列并停掉全部定时器。
+    for (const entries of this.pendingRequests.values()) {
+      for (const { timer } of entries) {
+        clearTimeout(timer);
+      }
+    }
+    this.pendingRequests.clear();
   }
 }
