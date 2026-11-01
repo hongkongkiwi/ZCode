@@ -109,3 +109,25 @@ fork host process ──────────→
 - `packages/rpc/src/channels.ts` — `ChannelServer` 构造函数加 `deferInit` 参数，新增 `ready()` 方法
 - `packages/rpc/src/logging-middleware.ts` — `LoggingChannelServer` 透传 `ready()`
 - `packages/desktop/src/host/index.ts` — remote 模式传 `deferInit=true`，服务注册后调 `server.ready()`
+
+## pending 请求的终态语义（超时 / 取消 / dispose）
+
+`pendingRequests` 只暂存"channel 尚未注册"的请求，不改变请求自身的生命周期边界。终态规则：
+
+- **超时即终态**：超时定时器先把条目移出所在队列，再按请求类型回终态帧：`Promise` 回 `PromiseError`；`EventListen` 回 `EventError`（终结该次订阅周期，客户端释放监听器后可重新订阅；旧客户端忽略未知 `205` 响应）。此后即使 `registerChannel` 到来，也不得再执行该请求或建立该订阅。
+- **取消即终态**：`PromiseCancel` / `EventDispose` 同时作用于 `activeRequests` 与 `pendingRequests`（按请求 id 移除并停掉定时器）。客户端已取消的请求，迟到的 `registerChannel` 不得执行，也不再补发超时错误。
+- **dispose 即终态**：`dispose()` 清空全部 pending 定时器与队列；`registerChannel` 的延迟 flush 与超时回包在 dispose 后不再执行、不再发送。
+- 保留语义：请求在超时窗口内等到 channel 注册，则恰好执行一次。
+
+事件顺序（owner：`ChannelServer` 独占 pending 队列与其定时器）：
+
+```text
+client                    ChannelServer                channel
+  │ Promise(id) ─────────► │                             │
+  │                        │ channel 未注册 → 入队+定时器 │
+  │ PromiseCancel(id) ───► │ 按 id 移除 pending+定时器    │
+  │                        │                             │
+  │                        │ registerChannel ◄───────────┤ 迟到
+  │                        │ flush 只执行仍在队列的请求    │
+  │           （已取消的 id 不执行、不再回包）             │
+```
