@@ -10,9 +10,13 @@ import type { WebRemoteControlMobileLogEntry } from "@zcode/shared";
 export const MOBILE_LOG_SINK_DEFAULTS = {
   maxFileBytes: 4 * 1024 * 1024,
   maxDeviceDirBytes: 32 * 1024 * 1024,
+  /** 所有设备目录合计的全局预算；超出时跨设备按 mtime 删最旧文件。 */
+  maxTotalBytes: 256 * 1024 * 1024,
   retentionDays: 14,
   /** 排队未写完的帧上限；手机异常刷屏时丢新帧，防止内存无限增长。 */
   maxPendingFrames: 500,
+  /** openFiles/warnedKeys 缓存键上限；防止对端轮换身份让缓存键无限增长。 */
+  maxCacheEntries: 64,
 } as const;
 
 const LOG_FILE_SUFFIX = ".jsonl";
@@ -38,7 +42,9 @@ export interface MobileLogSinkOptions {
   rootDir: string;
   maxFileBytes?: number;
   maxDeviceDirBytes?: number;
+  maxTotalBytes?: number;
   retentionDays?: number;
+  maxCacheEntries?: number;
   now?: () => Date;
   logger: {
     info: (...args: unknown[]) => void;
@@ -98,6 +104,8 @@ async function listLogFiles(
 export function createMobileLogSink(options: MobileLogSinkOptions): MobileLogSink {
   const maxFileBytes = options.maxFileBytes ?? MOBILE_LOG_SINK_DEFAULTS.maxFileBytes;
   const maxDeviceDirBytes = options.maxDeviceDirBytes ?? MOBILE_LOG_SINK_DEFAULTS.maxDeviceDirBytes;
+  const maxTotalBytes = options.maxTotalBytes ?? MOBILE_LOG_SINK_DEFAULTS.maxTotalBytes;
+  const maxCacheEntries = options.maxCacheEntries ?? MOBILE_LOG_SINK_DEFAULTS.maxCacheEntries;
   const retentionDays = options.retentionDays ?? MOBILE_LOG_SINK_DEFAULTS.retentionDays;
   const now = options.now ?? (() => new Date());
   const openFiles = new Map<string, OpenFileState>();
@@ -131,6 +139,31 @@ export function createMobileLogSink(options: MobileLogSinkOptions): MobileLogSin
     }
   }
 
+  /**
+   * 全局预算：所有设备目录合计超过 maxTotalBytes 时跨设备按 mtime 删最旧文件。
+   * 修复原因：按设备的上限以调用方传入的 deviceKey 分区，对端轮换自报身份即可
+   * 绕过；必须有与分区无关的总量上界。
+   */
+  async function enforceTotalBudget(currentFilePath: string): Promise<void> {
+    const deviceDirs = await readdir(options.rootDir).catch(() => [] as string[]);
+    const files: Array<{ path: string; size: number; mtimeMs: number }> = [];
+    for (const deviceDir of deviceDirs) {
+      const dir = join(options.rootDir, deviceDir);
+      for (const file of await listLogFiles(dir)) {
+        files.push({ path: join(dir, file.name), size: file.size, mtimeMs: file.mtimeMs });
+      }
+    }
+    let total = files.reduce((sum, file) => sum + file.size, 0);
+    if (total <= maxTotalBytes) return;
+    files.sort((left, right) => left.mtimeMs - right.mtimeMs);
+    for (const file of files) {
+      if (total <= maxTotalBytes) break;
+      if (file.path === currentFilePath) continue;
+      await unlink(file.path).catch(() => {});
+      total -= file.size;
+    }
+  }
+
   /** 进程内首次写某会话文件时，接着已有的最大分片续写（重启/重连不覆盖旧文件）。 */
   async function resumeFileState(dir: string, baseName: string): Promise<OpenFileState> {
     let part = 0;
@@ -157,9 +190,18 @@ export function createMobileLogSink(options: MobileLogSinkOptions): MobileLogSin
     await mkdir(dir, { recursive: true });
 
     let state = openFiles.get(stateKey);
-    if (!state) {
+    if (state) {
+      // LRU touch：命中即重排到末尾，淘汰从最旧键开始。
+      openFiles.delete(stateKey);
+      openFiles.set(stateKey, state);
+    } else {
       state = await resumeFileState(dir, baseName);
       openFiles.set(stateKey, state);
+      while (openFiles.size > maxCacheEntries) {
+        const oldest = openFiles.keys().next().value;
+        if (oldest === undefined) break;
+        openFiles.delete(oldest);
+      }
     }
     const body = `${events.map(serializeMobileLogEntry).join("\n")}\n`;
     const bodyBytes = Buffer.byteLength(body, "utf8");
@@ -182,8 +224,11 @@ export function createMobileLogSink(options: MobileLogSinkOptions): MobileLogSin
     }
     await appendFile(filePath, chunk, "utf8");
     state.size += Buffer.byteLength(chunk, "utf8");
-    // 只在新开文件（含滚动）时检查目录上限，避免每帧都扫目录。
-    if (isNewFile) await enforceDeviceDirCap(dir, fileName);
+    // 只在新开文件（含滚动）时检查目录与全局上限，避免每帧都扫目录。
+    if (isNewFile) {
+      await enforceDeviceDirCap(dir, fileName);
+      await enforceTotalBudget(filePath);
+    }
   }
 
   return {
@@ -207,6 +252,12 @@ export function createMobileLogSink(options: MobileLogSinkOptions): MobileLogSin
           const key = `${target.deviceKey}/${target.sessionKey}`;
           if (warnedKeys.has(key)) return;
           warnedKeys.add(key);
+          // 插入序有界：淘汰后同键再次失败可再告警一次，防对端轮换身份撑大去重集合。
+          while (warnedKeys.size > maxCacheEntries) {
+            const oldest = warnedKeys.keys().next().value;
+            if (oldest === undefined) break;
+            warnedKeys.delete(oldest);
+          }
           options.logger.warn("[web-remote-control] mobile log write failed", {
             error: error instanceof Error ? error.message : String(error),
           });
