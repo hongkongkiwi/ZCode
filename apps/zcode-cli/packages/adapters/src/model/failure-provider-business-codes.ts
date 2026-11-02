@@ -289,6 +289,21 @@ const PROVIDER_BUSINESS_CODE_MAPPINGS = new Map<string, ProviderBusinessCodeMapp
       retryable: true,
     },
   ],
+  // OmniRoute's turn guard answers 409 turn_in_progress while the same
+  // idempotency key is still streaming. The collision clears when that turn
+  // finishes (the gateway sends Retry-After: 1), so it is a wait-and-retry,
+  // not a terminal request failure. Unmapped, it falls through to the
+  // unknown branch and the turn dies on attempt 1.
+  [
+    "turn_in_progress",
+    {
+      code: ModelErrorCode.ModelRequestFailed,
+      message: "An identical request is already in progress.",
+      reason: ModelFailureReasonValue.ServerError,
+      retryReason: ModelRetryReasonValue.ServerError,
+      retryable: true,
+    },
+  ],
 ]);
 
 // 这些 code 均来自 provider 官方文档，且语义需要用户充值、调整套餐或等待长期额度重置。

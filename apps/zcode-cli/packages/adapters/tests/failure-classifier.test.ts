@@ -286,6 +286,37 @@ describe("classifyModelFailure provider business codes", () => {
     }
   });
 
+  it("retries an OmniRoute turn_in_progress 409 instead of failing the turn", () => {
+    const failure = classifyModelFailure(
+      new ProviderBusinessError({
+        providerCode: "turn_in_progress",
+        providerId: "omnirouter",
+        providerKind: "openai-compatible",
+        providerMessage: "An identical request is already in progress",
+        responseBodySummary: {
+          error: {
+            code: "turn_in_progress",
+            message: "An identical request is already in progress",
+            type: "turn_in_progress",
+          },
+        },
+        responseHeaders: { "retry-after": "1" },
+        responseStatus: 409,
+        statusCode: 409,
+      }),
+    );
+
+    expect(failure).toMatchObject({
+      code: "model_request_failed",
+      message: "An identical request is already in progress.",
+      reason: "server_error",
+      retryReason: "server_error",
+      retryable: true,
+      retryAfterMs: 1000,
+      statusCode: 409,
+    });
+  });
+
   it("maps upstream 2007 failures to retryable server errors", () => {
     const failure = classifyModelFailure(
       new ProviderBusinessError({
